@@ -1,5 +1,6 @@
-# Remote-Sensing-Based-Crop-Health-Classification
-Using satellite remote sensing for crop health monitoring and classfication.  Multi-Index Time-Series Dashboard: NDVI (Vigor), EVI (Biomass), and SAVI (Young Crops). Canopy Hydration Monitoring: NDWI (Normalized Difference Water Index) to track moisture stress. Daily ERA5-Land precipitation charting over the temporal window. 
-
-It is done by implimenting the research paper:
+# Remote Sensing-Based Crop Health Classification Using Multi-Feature Index Fusion and FCNNs
 https://arxiv.org/pdf/2504.10522
+
+An end-to-end precision agriculture pipeline that uses high-resolution remote sensing imagery (UAV/Satellite) to classify crop health conditions. By integrating standard vegetation indices into a learnable Hybrid Vegetation Index (HVI) and tracking multi-temporal disease progression, this system utilizes a Fully Connected Neural Network (FCNN) to achieve 97.80% validation accuracy in detecting early-stage crop diseases like rust.
+
+Multi-Feature Input Processing: Ingests raw multispectral/hyperspectral bands, automatically handling atmospheric noise and isolating vegetation from background noise (soil, rocks).Learnable Hybrid Vegetation Index (HVI): Dynamically optimizes the fusion weights of multiple indices (NDVI, GNDVI, EVI, MSAVI) directly inside the neural network's backpropagation loop.Multi-Temporal Analysis: Tracks time-series data to trace physiological degradation over a timeline, reducing false negatives in early disease stages.Production-Ready FCNN: Includes a robust classification architecture utilizing localized features, non-linear activations (ReLU), and structural regularization (Dropout $p=0.5$) to eliminate spatial overfitting.Direct Business Impact: Generates targeted field condition maps to minimize resource waste (fertilizers/pesticides) and eliminate labor-intensive manual inspections.
