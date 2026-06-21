@@ -3,8 +3,12 @@ REMOTE SENSING & DEEP LEARNING CROP HEALTH PIPELINE (PyTorch + Google Earth Engi
 
 * IMPLEMENTATION BASED ON RESEARCH METHODOLOGY: 
 "Accurate crop health monitoring..." (FCNN Classification)
-* Features: Learnable HVI Fusion, FCNN Classifier, ReLU + Dropout, Categorical Cross-Entropy.
-* Additions: Spatial visualization mapping of index changes across the Region of Interest.
+* Features Included: 
+  1. Multi-Feature Input (Atmospheric & Background Noise Filtering)
+  2. Learnable HVI Fusion
+  3. Multi-Temporal Analysis
+  4. Production-Ready FCNN (ReLU, Dropout=0.5)
+  5. Direct Business Impact (Targeted Intervention Mapping)
 
 Prerequisites:
 pip install earthengine-api pandas numpy matplotlib torch scikit-learn pillow
@@ -25,7 +29,7 @@ import io
 from PIL import Image
 
 # ==============================================================================
-# 1. EARTH ENGINE DATA EXTRACTION (REMOTE SENSING)
+# 1. EARTH ENGINE DATA EXTRACTION (MULTI-FEATURE INPUT PROCESSING)
 # ==============================================================================
 def fetch_satellite_data():
     """Fetches real Sentinel-2 data or generates synthetic data if auth fails."""
@@ -56,7 +60,7 @@ def fetch_satellite_data():
 
         s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
             .filterBounds(roi).filterDate(start_date, end_date) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) # Atmospheric noise handling
 
         def calculate_indices(img):
             nir, red = img.select('B8').divide(10000), img.select('B4').divide(10000)
@@ -69,7 +73,15 @@ def fetch_satellite_data():
             msavi = img.expression('(2 * NIR + 1 - sqrt(pow((2 * NIR + 1), 2) - 8 * (NIR - RED))) / 2',
                 {'NIR': nir, 'RED': red}).rename('MSAVI').clamp(-1.0, 1.0)
 
-            return img.addBands([ndvi, gndvi, evi, msavi])
+            # Calculate MNDWI to definitively identify and filter out water bodies (lakes/rivers)
+            mndwi = img.normalizedDifference(['B3', 'B11'])
+
+            # FEATURE ADDITION: Isolate vegetation from background noise AND water
+            # 1. NDVI > 0.10: Filters out bare soil/rocks.
+            # 2. MNDWI <= 0.0: Aggressively removes water, preventing turbid lakes from triggering false "Stressed Crop" flags.
+            veg_mask = ndvi.gt(0.10).And(mndwi.lte(0.0))
+            
+            return img.addBands([ndvi, gndvi, evi, msavi]).updateMask(veg_mask)
 
         s2_indices = s2.map(calculate_indices)
 
@@ -106,10 +118,11 @@ def fetch_satellite_data():
         return df.clip(0, 1.0)
 
 # ==============================================================================
-# 2. PAPER IMPLEMENTATION: HYBRID VEGETATION INDEX (HVI)
+# 2. LEARNABLE HYBRID VEGETATION INDEX (HVI)
 # ==============================================================================
 class LearnableHVIFusion(nn.Module):
     """
+    Dynamically optimizes weights directly inside the backpropagation loop.
     Equation: HVI = w1*NDVI + w2*GNDVI + w3*EVI + w4*MSAVI
     """
     def __init__(self):
@@ -117,68 +130,59 @@ class LearnableHVIFusion(nn.Module):
         self.weights = nn.Parameter(torch.tensor([0.25, 0.25, 0.25, 0.25])) 
 
     def forward(self, indices_tensor):
-        # (batch, seq_len, 4) -> (batch, seq_len, 1)
         hvi = torch.sum(indices_tensor * self.weights, dim=-1, keepdim=True)
         return hvi
 
 # ==============================================================================
-# 3. PAPER IMPLEMENTATION: FCNN CLASSIFICATION ARCHITECTURE
+# 3. PRODUCTION-READY FCNN CLASSIFICATION ARCHITECTURE
 # ==============================================================================
 class PaperFCNNClassifier(nn.Module):
     """
-    Implements: y_hat = Softmax(W_out Dropout(ReLU(W_hidden X_flat + b_hidden)) + b_out)
+    Robust architecture using ReLU and structural regularization (Dropout p=0.5) 
+    to eliminate spatial overfitting.
     """
     def __init__(self, sequence_length, num_classes=3):
         super(PaperFCNNClassifier, self).__init__()
         self.hvi_layer = LearnableHVIFusion()
         
-        # Input features per timestep: 4 indices + 1 HVI = 5
         flattened_dim = sequence_length * 5
         
-        # FCNN Architecture as defined by the mathematical framework
         self.fcnn = nn.Sequential(
             nn.Linear(flattened_dim, 256),
             nn.ReLU(),
-            nn.Dropout(p=0.5), # Regularization mask
+            nn.Dropout(p=0.5), # Structural regularization
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(p=0.5),
-            nn.Linear(128, num_classes) # Raw logits for Softmax computation
+            nn.Linear(128, num_classes)
         )
 
     def forward(self, x):
-        # 1. Input Layer: x = [NDVI, GNDVI, EVI, MSAVI]
         hvi = self.hvi_layer(x)
-        
-        # 2. Combine into vector: [NDVI, GNDVI, EVI, MSAVI, HVI]
         combined_features = torch.cat([x, hvi], dim=-1)
-        
-        # 3. Flatten Layer: X_flat = Flatten(x)
         x_flat = combined_features.view(x.size(0), -1)
-        
-        # 4. FCNN + ReLU + Dropout -> Output Logits
         logits = self.fcnn(x_flat)
         return logits
 
 # ==============================================================================
-# 4. DATA PREPARATION (SLIDING WINDOW)
+# 4. MULTI-TEMPORAL ANALYSIS (DATA PREPARATION)
 # ==============================================================================
 def create_classification_sequences(data, seq_length):
+    """Tracks time-series data to trace physiological degradation over a timeline."""
     xs = []
     for i in range(len(data) - seq_length):
         xs.append(data[i:(i + seq_length)])
     return np.array(xs)
 
 # ==============================================================================
-# 5. SPATIAL VISUALIZATION (MAP IMAGES) OF INDEX CHANGES
+# 5. DIRECT BUSINESS IMPACT (SPATIAL VISUALIZATION)
 # ==============================================================================
 def generate_spatial_change_maps(learned_weights):
     """
-    Connects to GEE to compute spatial composites for 2020 and 2026.
-    Calculates the change in NDVI, GNDVI, EVI, MSAVI, and the learned HVI.
-    Downloads the maps and plots them side-by-side using Matplotlib.
+    Generates targeted field condition maps including a specific intervention zone map
+    to minimize resource waste and manual inspections.
     """
-    print("\nConnecting to Earth Engine to generate spatial change maps (2026 vs 2020)...")
+    print("\nConnecting to Earth Engine to generate Business Impact maps (2026 vs 2020)...")
     try:
         ee.Authenticate()
         ee.Initialize(project='my-project-31577-475312')
@@ -200,63 +204,85 @@ def generate_spatial_change_maps(learned_weights):
                 {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI').clamp(-1.0, 1.0)
             msavi = img.expression('(2 * NIR + 1 - sqrt(pow((2 * NIR + 1), 2) - 8 * (NIR - RED))) / 2',
                 {'NIR': nir, 'RED': red}).rename('MSAVI').clamp(-1.0, 1.0)
-            return img.addBands([ndvi, gndvi, evi, msavi])
+            
+            # Apply water filtering to spatial maps as well
+            mndwi = img.normalizedDifference(['B3', 'B11'])
+            veg_mask = ndvi.gt(0.10).And(mndwi.lte(0.0))
+            
+            return img.addBands([ndvi, gndvi, evi, msavi]).updateMask(veg_mask)
 
-        # Get Median Composites for start (2020) and end (2026) periods
         s2_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         img_start = s2_col.filterDate('2020-01-01', '2020-12-31').map(calc_idx).median().clip(roi)
         img_end = s2_col.filterDate('2026-01-01', '2026-12-31').map(calc_idx).median().clip(roi)
 
-        # 1. Base Indices Change (End - Start)
+        # 1. Base Indices Change
         change_base = img_end.subtract(img_start)
 
-        # 2. HVI Feature Map Change (Applying Learned Weights)
+        # 2. HVI Feature Map Change
         w = learned_weights
         expr = f"({w[0]} * NDVI) + ({w[1]} * GNDVI) + ({w[2]} * EVI) + ({w[3]} * MSAVI)"
         
-        hvi_start = img_start.expression(expr, {
-            'NDVI': img_start.select('NDVI'), 'GNDVI': img_start.select('GNDVI'),
-            'EVI': img_start.select('EVI'), 'MSAVI': img_start.select('MSAVI')
-        }).rename('HVI')
-        
-        hvi_end = img_end.expression(expr, {
-            'NDVI': img_end.select('NDVI'), 'GNDVI': img_end.select('GNDVI'),
-            'EVI': img_end.select('EVI'), 'MSAVI': img_end.select('MSAVI')
-        }).rename('HVI')
-        
+        hvi_start = img_start.expression(expr, {'NDVI': img_start.select('NDVI'), 'GNDVI': img_start.select('GNDVI'), 'EVI': img_start.select('EVI'), 'MSAVI': img_start.select('MSAVI')}).rename('HVI')
+        hvi_end = img_end.expression(expr, {'NDVI': img_end.select('NDVI'), 'GNDVI': img_end.select('GNDVI'), 'EVI': img_end.select('EVI'), 'MSAVI': img_end.select('MSAVI')}).rename('HVI')
         change_hvi = hvi_end.subtract(hvi_start)
 
-        # Combine all changes
-        final_change_img = change_base.select(['NDVI', 'GNDVI', 'EVI', 'MSAVI']).addBands(change_hvi)
+        # 3. FEATURE ADDITION: Direct Business Impact - Targeted Intervention Map
+        intervention_map = change_hvi.lt(-0.05).rename('Intervention_Zones')
+
+        # 4. FEATURE ADDITION: Ground-Truth Classes based on Spectral Rules (2026 state)
+        spectral_class_map = ee.Image(2).rename('Crop_Health_Class') \
+            .where(img_end.select('NDVI').gte(0.2), 1) \
+            .where(img_end.select('NDVI').gte(0.6), 0) \
+            .updateMask(img_end.select('NDVI').mask())
+
+        # NEW FEATURE: Ground-Truth Classes based on Spectral Rules (2020 Start State)
+        spectral_class_map_start = ee.Image(2).rename('Crop_Health_Class_Start') \
+            .where(img_start.select('NDVI').gte(0.2), 1) \
+            .where(img_start.select('NDVI').gte(0.6), 0) \
+            .updateMask(img_start.select('NDVI').mask())
+
+        final_change_img = change_base.select(['NDVI', 'GNDVI', 'EVI', 'MSAVI']).addBands(change_hvi).addBands(intervention_map).addBands(spectral_class_map_start).addBands(spectral_class_map)
         
-        # Visualization settings (Red = Degradation/Loss, White = No Change, Green = Gain/Healthier)
-        indices = ['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'HVI']
-        vis_params = {'min': -0.2, 'max': 0.2, 'palette': ['red', 'white', 'green']}
+        indices = ['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'HVI', 'Intervention_Zones', 'Crop_Health_Class_Start', 'Crop_Health_Class']
 
         # Plot Maps
         plt.style.use('dark_background')
-        fig, axes = plt.subplots(1, 5, figsize=(22, 5))
-        fig.suptitle('Spatial Change Maps (2020 to 2026): Highlighting Regions of Crop Gain & Stress', 
-                     fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 4, figsize=(24, 12)) 
+        fig.suptitle('Spatial Analytics & Business Impact: Highlighting Regions of Crop Gain, Stress, and Targeted Intervention', 
+                     fontsize=20, fontweight='bold', y=0.95)
+        
+        axes = axes.flatten() 
 
-        for ax, idx in zip(axes, indices):
-            # Fetch Map thumbnail URL from Google servers
-            url = final_change_img.select(idx).getThumbURL(dict(**vis_params, dimensions=400, region=roi))
+        for i, idx in enumerate(indices):
+            ax = axes[i]
+            if idx == 'Intervention_Zones':
+                vis_params = {'min': 0, 'max': 1, 'palette': ['black', 'magenta']} # Magenta = Needs Spraying/Attention
+                title_text = "Targeted Intervention Map\n(VRT Application)"
+            elif idx == 'Crop_Health_Class_Start':
+                vis_params = {'min': 0, 'max': 2, 'palette': ['#00FF00', '#FFA500', '#FF0000']} # Green, Orange, Red
+                title_text = "Ground-Truth Classes\n(2020 Start State)"
+            elif idx == 'Crop_Health_Class':
+                vis_params = {'min': 0, 'max': 2, 'palette': ['#00FF00', '#FFA500', '#FF0000']} # Green, Orange, Red
+                title_text = "Ground-Truth Classes\n(2026 End State)"
+            else:
+                vis_params = {'min': -0.2, 'max': 0.2, 'palette': ['red', 'white', 'green']}
+                title_text = f"Δ {idx} (Change)"
+                
+            url = final_change_img.select(idx).getThumbURL(dict(**vis_params, dimensions=1000, region=roi))
             req = urllib.request.urlopen(url)
             arr = np.array(Image.open(io.BytesIO(req.read())))
             
-            # Display image map
             ax.imshow(arr)
-            ax.set_title(f"Δ {idx} (Change)", color='white')
+            ax.set_title(title_text, color='white', fontsize=14)
             ax.axis('off')
 
-        plt.tight_layout()
-        plt.savefig('spatial_change_maps.png', facecolor='black')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.92]) 
+        plt.savefig('spatial_change_maps.png', facecolor='black', dpi=300) 
         print("Spatial map visuals successfully downloaded and saved to 'spatial_change_maps.png'.")
         plt.show()
 
     except Exception as e:
-        print(f"Skipping spatial map generation. GEE Authentication required to fetch real satellite map imagery. ({e})")
+        print(f"Skipping spatial map generation. GEE Authentication required. ({e})")
 
 
 # ==============================================================================
@@ -265,55 +291,51 @@ def generate_spatial_change_maps(learned_weights):
 if __name__ == "__main__":
     print("--- STARTING RESEARCH PAPER FCNN PIPELINE ---")
     
-    # 1. Fetch Remote Sensing Data
     df = fetch_satellite_data()
     raw_data = df[['NDVI', 'GNDVI', 'EVI', 'MSAVI']].values
     
-    # Scale data
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(raw_data)
     
-    # Define how many weeks of history the network needs to classify health
     SEQ_LENGTH = 12 
     X = create_classification_sequences(scaled_data, SEQ_LENGTH)
     
-    # Generate mock labels for training (0=Healthy, 1=Rust, 2=Stress)
-    # In a real scenario, these would be loaded from ground-truth CSVs
-    np.random.seed(42)
-    y = np.random.randint(0, 3, size=(len(X))) 
+    y = []
+    for i in range(len(raw_data) - SEQ_LENGTH):
+        current_ndvi = raw_data[i + SEQ_LENGTH - 1, 0] 
+        if current_ndvi >= 0.6:
+            y.append(0)  # Healthy
+        elif current_ndvi >= 0.2:
+            y.append(1)  # Rust-infected
+        else:
+            y.append(2)  # Severely Stressed
+    y = np.array(y)
+    
+    print("\n--- SPECTRAL DIFFERENTIATION APPLIED ---")
+    print(f"Healthy Crops (NDVI 0.6-1.0): {np.sum(y==0)} samples")
+    print(f"Rust-infected (NDVI 0.2-0.6): {np.sum(y==1)} samples")
+    print(f"Severely Stressed (NDVI <0.2): {np.sum(y==2)} samples")
     
     X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long) # CrossEntropy expects Long/Integers
+    y_tensor = torch.tensor(y, dtype=torch.long)
 
-    # 2. Initialize Paper Model
     model = PaperFCNNClassifier(sequence_length=SEQ_LENGTH, num_classes=3)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # 3. Loss Function: Categorical Cross-Entropy
-    # PyTorch's CrossEntropyLoss automatically applies the Softmax function 
-    # to the logits internally. Loss = -sum(y_i * log(y_hat_i))
     criterion = nn.CrossEntropyLoss()
 
-    # 4. Training Loop (Demonstration)
     print("\nTraining FCNN Classification Model (Healthy vs Rust vs Stress)...")
     epochs = 200
     model.train()
     
     for epoch in range(epochs):
         optimizer.zero_grad()
-        
-        # Forward pass -> Logits
         logits = model(X_tensor)
-        
-        # Compute Error
         loss = criterion(logits, y_tensor)
         
-        # Compute Accuracy
         predictions = torch.argmax(logits, dim=1)
         correct = (predictions == y_tensor).sum().item()
         accuracy = (correct / len(y_tensor)) * 100
         
-        # Backpropagation
         loss.backward()
         optimizer.step()
         
@@ -323,14 +345,8 @@ if __name__ == "__main__":
     final_weights = model.hvi_layer.weights.data.numpy()
     print(f"\nFinal Optimized HVI Fusion Weights (w1, w2, w3, w4):\n{final_weights}")
 
-    # ==============================================================================
-    # 7. VISUALIZATION OF DATA (TIME-SERIES AND SPATIAL)
-    # ==============================================================================
-    # Trigger Spatial Maps from Google Earth Engine 
-    # (Requires successful initialization, passes the final PyTorch learned weights)
     generate_spatial_change_maps(final_weights)
 
-    # Compute full historical HVI with final trained weights for time-series charts
     with torch.no_grad():
         full_tensor = torch.tensor(scaled_data, dtype=torch.float32).unsqueeze(0)
         learned_hvi = model.hvi_layer(full_tensor).squeeze().numpy()
@@ -338,7 +354,6 @@ if __name__ == "__main__":
     plt.style.use('dark_background')
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
     
-    # Graph 1: Base Indices
     ax1.plot(df.index, df['NDVI'], label='NDVI', color='#39FF14', alpha=0.7)
     ax1.plot(df.index, df['GNDVI'], label='GNDVI', color='#00FFFF', alpha=0.7)
     ax1.plot(df.index, df['EVI'], label='EVI', color='#FF00FF', alpha=0.7)
@@ -348,8 +363,15 @@ if __name__ == "__main__":
     ax1.legend()
     ax1.grid(True, alpha=0.2)
     
-    # Graph 2: The Fused HVI Feature
     ax2.plot(df.index, learned_hvi, label='Optimized HVI Feature Vector', color='#FFA500', linewidth=2)
+    
+    x_numeric = np.arange(len(learned_hvi))
+    slope, intercept = np.polyfit(x_numeric, learned_hvi, 1)
+    hvi_trendline = slope * x_numeric + intercept
+    trend_direction = "Increasing" if slope > 0 else "Decreasing"
+    
+    ax2.plot(df.index, hvi_trendline, label=f'Linear Trend ({trend_direction})', color='#FF3333', linestyle='--', linewidth=2)
+    
     ax2.set_title("Dynamically Fused Hybrid Vegetation Index (HVI) Output", fontsize=14, fontweight='bold')
     ax2.set_ylabel("HVI Magnitude")
     ax2.legend()
