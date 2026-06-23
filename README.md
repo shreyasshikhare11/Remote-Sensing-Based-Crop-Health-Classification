@@ -1,4 +1,4 @@
-# Remote Sensing-Based Crop Health Classification Using Multi-Feature Index Fusion and FCNNs
+# Remote Sensing-Based Crop Health Classification NDVI and Fully Connected Neural Netwroks
 https://arxiv.org/pdf/2504.10522
 
 A precise agriculture pipeline that uses high-resolution remote sensing satellite imagery to classify crop health conditions. By integrating standard vegetation indices (NDVI, GNDVI, EVI, MSAVI) into a learnable Hybrid Vegetation Index (HVI) and tracking multi-temporal disease progression, this system utilizes a Fully Connected Neural Network (FCNN) to achieve 97.80% validation accuracy in detecting early-stage crop diseases like rust.
