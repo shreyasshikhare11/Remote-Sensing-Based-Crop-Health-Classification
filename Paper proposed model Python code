@@ -1,0 +1,452 @@
+import os
+import ee
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.preprocessing import MinMaxScaler
+import urllib.request
+import io
+from PIL import Image
+import warnings
+warnings.filterwarnings('ignore')
+
+ROI_COORDINATES = [
+    [0.11418197537867325, 51.60197836363603],
+    [0.11761520291773575, 51.58480890623496],
+    [0.11967513944117325, 51.5857688608265],
+    [0.13435218717066544, 51.58811533111258],
+    [0.1381287374636342,  51.59024838075696],
+    [0.14190528775660294, 51.59094160032738],
+    [0.1422486105105092,  51.593287803457216],
+    [0.15083167935816544, 51.597553316868726],
+    [0.15246246243922013, 51.59797984617759],
+    [0.1381287374636342,  51.60203167482375],
+    [0.1360688009401967,  51.604590538230035],
+    [0.1292023458620717,  51.60864177704568]
+]
+
+# ==============================================================================
+# BLOCK 1 & 3: DATA ACQUISITION & PRE-PROCESSING (CLOUD MASKING)
+# ==============================================================================
+def mask_s2_clouds(image):
+    """
+    Addresses Environmental Variability: Uses QA60 band to mask out opaque
+    and cirrus clouds at the pixel level, preventing artificial NDVI drops.
+    """
+    qa = image.select('QA60')
+    cloudBitMask = 1 << 10
+    cirrusBitMask = 1 << 11
+    mask = (qa.bitwiseAnd(cloudBitMask).eq(0)
+              .And(qa.bitwiseAnd(cirrusBitMask).eq(0)))
+    return image.updateMask(mask)
+
+
+def fetch_satellite_data():
+    """Fetches Sentinel-2 weekly time-series or generates synthetic data if auth fails."""
+    start_date = '2020-06-28'
+    end_date   = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        ee.Authenticate()
+        ee.Initialize(project='my-project-31577-475312')
+        print("Earth Engine initialized. Fetching satellite data...")
+        roi = ee.Geometry.Polygon([ROI_COORDINATES])
+
+        s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+              .filterBounds(roi)
+              .filterDate(start_date, end_date)
+              .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+              .map(mask_s2_clouds))
+
+        # ==============================================================================
+        # BLOCK 2: HYBRID MULTI-INDEX INTEGRATION
+        #
+        # Paper Eq. (1): HVI = w1*NDVI + w2*GNDVI + w3*EVI + w4*MSAVI  ← 4 indices
+        # Paper Eq. (2): x   = [NDVI, GNDVI, EVI, MSAVI, HVI]          ← 5 features
+        #
+        # NDRE is fetched here for spatial change maps and visualisation only.
+        # It is NOT included in the FCNN input vector per the paper's equations.
+        # ==============================================================================
+        def calculate_indices(img):
+            nir      = img.select('B8').divide(10000)
+            red      = img.select('B4').divide(10000)
+            green    = img.select('B3').divide(10000)
+            blue     = img.select('B2').divide(10000)
+
+            ndvi  = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+            gndvi = img.normalizedDifference(['B8', 'B3']).rename('GNDVI')
+            ndre  = img.normalizedDifference(['B8', 'B5']).rename('NDRE')  # spatial viz only
+            evi   = img.expression(
+                '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+                {'NIR': nir, 'RED': red, 'BLUE': blue}
+            ).rename('EVI').clamp(-1.0, 1.0)
+            msavi = img.expression(
+                '(2 * NIR + 1 - sqrt(pow((2 * NIR + 1), 2) - 8 * (NIR - RED))) / 2',
+                {'NIR': nir, 'RED': red}
+            ).rename('MSAVI').clamp(-1.0, 1.0)
+
+            # Water body mask — prevents false stressed-crop classifications
+            mndwi    = img.normalizedDifference(['B3', 'B11'])
+            veg_mask = ndvi.gt(0.10).And(mndwi.lte(0.0))
+
+            return img.addBands([ndvi, gndvi, evi, msavi, ndre]).updateMask(veg_mask)
+
+        s2_indices = s2.map(calculate_indices)
+
+        def get_mean(img):
+            means = img.select(['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'NDRE']).reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=roi, scale=30,
+                bestEffort=True, maxPixels=1e12, tileScale=16)
+            return ee.Feature(None, {
+                'date':  img.date().format('YYYY-MM-dd'),
+                'NDVI':  means.get('NDVI'),
+                'GNDVI': means.get('GNDVI'),
+                'EVI':   means.get('EVI'),
+                'MSAVI': means.get('MSAVI'),
+                'NDRE':  means.get('NDRE'),  # kept for spatial maps
+            })
+
+        timeseries_fc = ee.FeatureCollection(s2_indices.map(get_mean))
+        data_list     = timeseries_fc.getInfo()['features']
+
+        records = [
+            [f['properties']['date'],
+             f['properties']['NDVI'],
+             f['properties']['GNDVI'],
+             f['properties']['EVI'],
+             f['properties']['MSAVI'],
+             f['properties']['NDRE']]
+            for f in data_list if f['properties'].get('NDVI') is not None
+        ]
+
+        df = pd.DataFrame(records, columns=['Date', 'NDVI', 'GNDVI', 'EVI', 'MSAVI', 'NDRE'])
+        df['Date'] = pd.to_datetime(df['Date'])
+
+        # PCHIP interpolation fills missing temporal observations smoothly
+        return (df.set_index('Date').sort_index()
+                  .resample('W').mean()
+                  .interpolate(method='pchip'))
+
+    except Exception as e:
+        print(f"GEE auth failed ({e}). Generating synthetic data...")
+        dates = pd.date_range(start=start_date, end=end_date, freq='W')
+        t     = np.linspace(0, len(dates), len(dates))
+        df    = pd.DataFrame({
+            'NDVI':  0.5  + 0.3  * np.sin(2 * np.pi * t / 52) + np.random.normal(0, 0.05, len(dates)),
+            'GNDVI': 0.55 + 0.25 * np.sin(2 * np.pi * t / 52) + np.random.normal(0, 0.04, len(dates)),
+            'EVI':   0.4  + 0.35 * np.sin(2 * np.pi * t / 52 - 0.2) + np.random.normal(0, 0.06, len(dates)),
+            'MSAVI': 0.45 + 0.28 * np.sin(2 * np.pi * t / 52 + 0.1) + np.random.normal(0, 0.05, len(dates)),
+            'NDRE':  0.48 + 0.26 * np.sin(2 * np.pi * t / 52 - 0.1) + np.random.normal(0, 0.04, len(dates)),
+        }, index=dates)
+        return df.clip(0, 1.0)
+
+
+# ==============================================================================
+# BLOCK 4: LEARNABLE HVI FUSION
+#
+# Equation (1): HVI = w1*NDVI + w2*GNDVI + w3*EVI + w4*MSAVI
+#               Four learnable weights, optimised via backpropagation.
+#               Weights initialised equally at 0.25 each.
+# ==============================================================================
+class LearnableHVIFusion(nn.Module):
+    def __init__(self):
+        super(LearnableHVIFusion, self).__init__()
+        # Exactly 4 weights — one per index in Eq. (1)
+        self.weights = nn.Parameter(torch.tensor([0.25, 0.25, 0.25, 0.25]))
+
+    def forward(self, indices_tensor):
+        # indices_tensor: [..., 4]  =  (NDVI, GNDVI, EVI, MSAVI)
+        hvi = torch.sum(indices_tensor * self.weights, dim=-1, keepdim=True)
+        return torch.clamp(hvi, 0.0, 1.0)
+
+
+# ==============================================================================
+# BLOCK 5: FCNN CLASSIFIER
+#
+# Equation (2): x     = [NDVI, GNDVI, EVI, MSAVI, HVI]  — 5 features/timestep
+# Equation (3): x_flat = Flatten(x)                      — temporal window → 1D
+# Equation (4): Z^(l) = W^(l) · a^(l-1) + b^l           — FC layer transform
+# Equation (5): a^(l) = ReLU(Z^(l))                      — non-linear activation
+# Equation (6): a_drop = a^(l) ⊙ r, r~Bernoulli(1-0.5)  — dropout regularisation
+# Equation (7): ŷ_i   = exp(Z_i) / Σ exp(Z_j)           — softmax (via CE loss)
+# Equation (8): Loss  = -Σ y_i · log(ŷ_i)               — categorical cross-entropy
+# Equation (9): ŷ = Softmax(W_out · Dropout(ReLU(W_hidden · x_flat + b_hidden)) + b_out)
+# ==============================================================================
+class FCNNClassifier(nn.Module):
+    """
+    Pure Fully Connected Neural Network for satellite time-series crop classification.
+
+    The multi-temporal window (seq_length observations × 5 features) is flattened
+    into a 1D vector per Eq. (3), giving the FCNN temporal context without a
+    recurrent encoder.
+
+    Data source: Sentinel-2 GEE (replaces the paper's Kaggle UAV dataset).
+    Architecture: faithful to paper Equations (2)–(9).
+    """
+    def __init__(self, seq_length=12, n_indices=4, hidden_dim=128, num_classes=3):
+        super(FCNNClassifier, self).__init__()
+        self.hvi_layer = LearnableHVIFusion()
+
+        # After HVI fusion: seq_length × (n_indices + 1 HVI) = 12 × 5 = 60
+        flat_dim = seq_length * (n_indices + 1)
+
+        # Fully Connected Neural Network — Eq. (4), (5), (6), (9)
+        self.classifier = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),  # W_hidden · x_flat + b_hidden
+            nn.ReLU(),                         # Eq. (5)
+            nn.Dropout(p=0.5),                # Eq. (6): p = 0.5 per paper
+            nn.Linear(hidden_dim, num_classes) # W_out output logits
+        )
+        # Note: Softmax Eq. (7) is applied implicitly by CrossEntropyLoss Eq. (8)
+
+    def forward(self, x):
+        # x: [batch, seq_length, 4]  (NDVI, GNDVI, EVI, MSAVI)
+        hvi      = self.hvi_layer(x)                  # [batch, seq_length, 1]
+        combined = torch.cat([x, hvi], dim=-1)         # [batch, seq_length, 5] — Eq. (2)
+        x_flat   = combined.view(combined.size(0), -1) # [batch, 60]            — Eq. (3)
+        logits   = self.classifier(x_flat)             # [batch, num_classes]   — Eq. (4-9)
+        return logits
+
+
+def create_classification_sequences(data, seq_length):
+    """Sliding-window sequences over the 4-index satellite time-series."""
+    xs = []
+    for i in range(len(data) - seq_length):
+        xs.append(data[i:(i + seq_length)])
+    return np.array(xs)  # [n_samples, seq_length, 4]
+
+
+# ==============================================================================
+# BLOCK 6: CLASSIFICATION RESULT & SPATIAL INTERVENTION MAPPING
+# ==============================================================================
+def generate_spatial_change_maps(learned_weights):
+    """
+    Generates field condition maps using the 4-weight HVI from the trained FCNN.
+    NDRE is included in the change maps as supplementary spectral information.
+    """
+    print("\nConnecting to GEE for spatial change maps (2020 vs 2026)...")
+    try:
+        ee.Authenticate()
+        ee.Initialize(project='my-project-31577-475312')
+        roi = ee.Geometry.Polygon([ROI_COORDINATES])
+
+        def calc_idx(img):
+            nir, red = img.select('B8').divide(10000), img.select('B4').divide(10000)
+            green, blue = img.select('B3').divide(10000), img.select('B2').divide(10000)
+
+            ndvi  = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+            gndvi = img.normalizedDifference(['B8', 'B3']).rename('GNDVI')
+            ndre  = img.normalizedDifference(['B8', 'B5']).rename('NDRE')
+            evi   = img.expression(
+                '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+                {'NIR': nir, 'RED': red, 'BLUE': blue}
+            ).rename('EVI').clamp(-1.0, 1.0)
+            msavi = img.expression(
+                '(2 * NIR + 1 - sqrt(pow((2 * NIR + 1), 2) - 8 * (NIR - RED))) / 2',
+                {'NIR': nir, 'RED': red}
+            ).rename('MSAVI').clamp(-1.0, 1.0)
+
+            mndwi    = img.normalizedDifference(['B3', 'B11'])
+            veg_mask = ndvi.gt(0.10).And(mndwi.lte(0.0))
+            return img.addBands([ndvi, gndvi, evi, msavi, ndre]).updateMask(veg_mask)
+
+        s2_col    = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                     .filterBounds(roi)
+                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                     .map(mask_s2_clouds))
+        img_start = s2_col.filterDate('2020-01-01', '2020-12-31').map(calc_idx).median().clip(roi)
+        img_end   = s2_col.filterDate('2026-01-01', '2026-12-31').map(calc_idx).median().clip(roi)
+
+        change_base = img_end.subtract(img_start)
+
+        # 4-weight HVI expression from the trained FCNN — Eq. (1)
+        w    = learned_weights
+        expr = f"({w[0]}*NDVI) + ({w[1]}*GNDVI) + ({w[2]}*EVI) + ({w[3]}*MSAVI)"
+
+        def hvi_image(img):
+            return img.expression(expr, {
+                'NDVI':  img.select('NDVI'),
+                'GNDVI': img.select('GNDVI'),
+                'EVI':   img.select('EVI'),
+                'MSAVI': img.select('MSAVI'),
+            }).rename('HVI').clamp(0.0, 1.0)
+
+        change_hvi       = hvi_image(img_end).subtract(hvi_image(img_start))
+        intervention_map = change_hvi.lt(-0.05).rename('Intervention_Zones')
+
+        spectral_class_start = (ee.Image(2).rename('Crop_Health_Class_Start')
+            .where(img_start.select('NDVI').gte(0.2), 1)
+            .where(img_start.select('NDVI').gte(0.6), 0)
+            .updateMask(img_start.select('NDVI').mask()))
+
+        spectral_class_end = (ee.Image(2).rename('Crop_Health_Class')
+            .where(img_end.select('NDVI').gte(0.2), 1)
+            .where(img_end.select('NDVI').gte(0.6), 0)
+            .updateMask(img_end.select('NDVI').mask()))
+
+        final_change_img = (change_base
+            .select(['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'NDRE'])
+            .addBands(change_hvi)
+            .addBands(intervention_map)
+            .addBands(spectral_class_start)
+            .addBands(spectral_class_end))
+
+        indices = ['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'NDRE', 'HVI',
+                   'Intervention_Zones', 'Crop_Health_Class_Start', 'Crop_Health_Class']
+
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(3, 3, figsize=(24, 20))
+        fig.suptitle('Spatial Analytics & Business Impact: Crop Gain, Stress, and Intervention Zones',
+                     fontsize=20, fontweight='bold', y=0.95)
+        axes = axes.flatten()
+
+        for i, idx in enumerate(indices):
+            ax = axes[i]
+            if idx == 'Intervention_Zones':
+                vis_params = {'min': 0, 'max': 1, 'palette': ['black', 'magenta']}
+                title_text = "Targeted Intervention Map\n(VRT Application)"
+            elif 'Crop_Health_Class' in idx:
+                vis_params = {'min': 0, 'max': 2, 'palette': ['#00FF00', '#FFA500', '#FF0000']}
+                title_text = f"Ground-Truth Classes\n({'2020 Start' if 'Start' in idx else '2026 End'})"
+            else:
+                vis_params = {'min': -0.2, 'max': 0.2, 'palette': ['red', 'white', 'green']}
+                title_text = f"Δ {idx} (Change)"
+
+            url = final_change_img.select(idx).getThumbURL(
+                dict(**vis_params, dimensions=1000, region=roi))
+            req = urllib.request.urlopen(url)
+            arr = np.array(Image.open(io.BytesIO(req.read())))
+            ax.imshow(arr)
+            ax.set_title(title_text, color='white', fontsize=14)
+            ax.axis('off')
+
+        plt.tight_layout(rect=[0, 0.02, 1, 0.92], h_pad=4.5, w_pad=2)
+        plt.savefig('spatial_change_maps.png', facecolor='black', dpi=300)
+        print("Saved 'spatial_change_maps.png'.")
+        plt.show()
+
+    except Exception as e:
+        print(f"Skipping spatial maps — GEE auth required. ({e})")
+
+
+# ==============================================================================
+# PIPELINE EXECUTION
+# ==============================================================================
+if __name__ == "__main__":
+    print("--- SATELLITE FCNN PIPELINE (Sentinel-2 GEE + Paper FCNN Architecture) ---")
+
+    df = fetch_satellite_data()
+
+    # Eq. (2): FCNN input uses only the 4 base indices.
+    # NDRE is excluded from the model per the paper's input vector definition.
+    raw_data   = df[['NDVI', 'GNDVI', 'EVI', 'MSAVI']].values  # [T, 4]
+    scaler     = MinMaxScaler()
+    scaled_data = scaler.fit_transform(raw_data)                 # [T, 4], normalised
+
+    SEQ_LENGTH = 12
+    X = create_classification_sequences(scaled_data, SEQ_LENGTH)  # [n, 12, 4]
+
+    # Spectral class labels from NDVI thresholds (paper, Section 5)
+    y = []
+    for i in range(len(raw_data) - SEQ_LENGTH):
+        current_ndvi = raw_data[i + SEQ_LENGTH - 1, 0]
+        if current_ndvi >= 0.6:
+            y.append(0)  # Healthy         (paper: NDVI 0.6–1.0)
+        elif current_ndvi >= 0.2:
+            y.append(1)  # Rust-infected   (paper: NDVI 0.2–0.6)
+        else:
+            y.append(2)  # Severely Stressed (paper: NDVI < 0.2)
+    y = np.array(y)
+
+    print("\n--- SPECTRAL DIFFERENTIATION APPLIED ---")
+    print(f"Healthy       (NDVI ≥ 0.6):  {np.sum(y == 0)} samples")
+    print(f"Rust-infected (NDVI 0.2–0.6):{np.sum(y == 1)} samples")
+    print(f"Stressed      (NDVI < 0.2):  {np.sum(y == 2)} samples")
+
+    X_tensor = torch.tensor(X, dtype=torch.float32)
+    y_tensor = torch.tensor(y, dtype=torch.long)
+
+    # Mini-batch training — paper uses batch_size=128 with 1,875 images.
+    # Scaled here for the smaller satellite time-series dataset.
+    BATCH_SIZE = min(128, max(16, len(y) // 4))
+    dataset    = TensorDataset(X_tensor, y_tensor)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model     = FCNNClassifier(seq_length=SEQ_LENGTH, n_indices=4, hidden_dim=128, num_classes=3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()  # Eq. (8): categorical cross-entropy
+
+    flat_dim = SEQ_LENGTH * 5
+    print(f"\nTraining FCNN | flat_dim={flat_dim} | hidden=128 | batch={BATCH_SIZE}")
+    EPOCHS = 150
+    model.train()
+
+    for epoch in range(EPOCHS):
+        epoch_loss, epoch_correct, epoch_total = 0.0, 0, 0
+
+        for X_batch, y_batch in dataloader:
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss   = criterion(logits, y_batch)  # Eq. (8)
+            loss.backward()                       # Backprop — updates W and HVI weights
+            optimizer.step()
+
+            preds          = torch.argmax(logits, dim=1)
+            epoch_correct += (preds == y_batch).sum().item()
+            epoch_total   += len(y_batch)
+            epoch_loss    += loss.item()
+
+        if (epoch + 1) % 25 == 0:
+            acc = 100.0 * epoch_correct / epoch_total
+            avg_loss = epoch_loss / len(dataloader)
+            print(f"Epoch [{epoch+1:>3}/{EPOCHS}] | Loss: {avg_loss:.4f} | Accuracy: {acc:.2f}%")
+
+    final_weights = model.hvi_layer.weights.data.numpy()
+    print(f"\nFinal HVI weights — Eq. (1) (NDVI, GNDVI, EVI, MSAVI):\n{final_weights}")
+
+    generate_spatial_change_maps(final_weights)
+
+    # ── Visualisation ──────────────────────────────────────────────────────────
+    with torch.no_grad():
+        full_tensor = torch.tensor(scaled_data, dtype=torch.float32).unsqueeze(0)  # [1, T, 4]
+        learned_hvi = model.hvi_layer(full_tensor).squeeze().numpy()               # [T]
+
+    plt.style.use('dark_background')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+
+    # Plot the 4 FCNN input indices + NDRE (clearly labelled as reference only)
+    ax1.plot(df.index, df['NDVI'],  label='NDVI',                     color='#39FF14', alpha=0.8)
+    ax1.plot(df.index, df['GNDVI'], label='GNDVI',                    color='#00FFFF', alpha=0.8)
+    ax1.plot(df.index, df['EVI'],   label='EVI',                      color='#FF00FF', alpha=0.8)
+    ax1.plot(df.index, df['MSAVI'], label='MSAVI',                    color='#FFFF00', alpha=0.8)
+    ax1.plot(df.index, df['NDRE'],  label='NDRE (spatial viz only)',   color='#FF6347', alpha=0.8,
+             linestyle='--', linewidth=1.5)
+    ax1.set_title("Input Indices — NDVI, GNDVI, EVI, MSAVI used in FCNN  |  NDRE for reference",
+                  fontsize=13, fontweight='bold')
+    ax1.set_ylabel("Index Value")
+    ax1.legend(ncol=5, fontsize=9)
+    ax1.grid(True, alpha=0.2)
+
+    ax2.plot(df.index, learned_hvi,
+             label='HVI (4-weight fusion, Eq. 1)', color='#FFA500', linewidth=2)
+    x_num  = np.arange(len(learned_hvi))
+    slope, intercept = np.polyfit(x_num, learned_hvi, 1)
+    trend  = "Increasing" if slope > 0 else "Decreasing"
+    ax2.plot(df.index, slope * x_num + intercept,
+             label=f'Linear trend ({trend})', color='#FF3333', linestyle='--', linewidth=2)
+    ax2.set_title("Hybrid Vegetation Index (HVI) — Eq. (1): 4-weight learnable fusion",
+                  fontsize=13, fontweight='bold')
+    ax2.set_ylabel("HVI Value")
+    ax2.legend()
+    ax2.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig('fcnn_paper_implementation.png')
+    print("\nSaved 'fcnn_paper_implementation.png'.")
+    plt.show()
