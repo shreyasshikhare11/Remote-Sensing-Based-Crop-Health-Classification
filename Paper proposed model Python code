@@ -10,6 +10,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import confusion_matrix, classification_report
 import urllib.request
 import io
 from PIL import Image
@@ -222,6 +224,35 @@ def create_classification_sequences(data, seq_length):
     return np.array(xs)  # [n_samples, seq_length, 4]
 
 
+def train_single_fold(X_tr, y_tr, X_vl, y_vl, seq_length, epochs=100):
+    """
+    Train a fresh FCNNClassifier on one CV fold and return val-set predictions.
+
+    A new model is instantiated per fold so weights never bleed between folds.
+    Batch size scales to fold size so early folds (small train set) don't crash.
+    """
+    batch_size = max(8, min(64, len(y_tr) // 4))
+    loader     = DataLoader(TensorDataset(X_tr, y_tr),
+                            batch_size=batch_size, shuffle=True)
+
+    fold_model = FCNNClassifier(seq_length=seq_length, n_indices=4,
+                                hidden_dim=128, num_classes=3)
+    optimizer  = optim.Adam(fold_model.parameters(), lr=1e-3)
+    criterion  = nn.CrossEntropyLoss()
+
+    fold_model.train()
+    for _ in range(epochs):
+        for X_b, y_b in loader:
+            optimizer.zero_grad()
+            criterion(fold_model(X_b), y_b).backward()
+            optimizer.step()
+
+    fold_model.eval()
+    with torch.no_grad():
+        preds = torch.argmax(fold_model(X_vl), dim=1).numpy()
+    return preds
+
+
 # ==============================================================================
 # BLOCK 6: CLASSIFICATION RESULT & SPATIAL INTERVENTION MAPPING
 # ==============================================================================
@@ -345,12 +376,28 @@ if __name__ == "__main__":
 
     # Eq. (2): FCNN input uses only the 4 base indices.
     # NDRE is excluded from the model per the paper's input vector definition.
-    raw_data   = df[['NDVI', 'GNDVI', 'EVI', 'MSAVI']].values  # [T, 4]
-    scaler     = MinMaxScaler()
-    scaled_data = scaler.fit_transform(raw_data)                 # [T, 4], normalised
+    raw_data = df[['NDVI', 'GNDVI', 'EVI', 'MSAVI']].values  # [T, 4]
+
+    # --------------------------------------------------------------------------
+    # TRAIN/VAL/TEST SPLIT — paper Section 5: 70-15-15 ratio.
+    #
+    # Time-series caveat: the paper's UAV image dataset is i.i.d., so a random
+    # 70-15-15 split is valid there. Our data is a continuous weekly time
+    # series, so a random split would leak future information into training
+    # via overlapping sequence windows and an over-optimistic scaler fit.
+    # We instead split CHRONOLOGICALLY (train = earliest 70%, val = next 15%,
+    # test = most recent 15%), and fit the scaler on the training segment only.
+    # --------------------------------------------------------------------------
+    n         = len(raw_data)
+    train_end = int(n * 0.70)
+    val_end   = int(n * 0.85)
+
+    scaler = MinMaxScaler()
+    scaler.fit(raw_data[:train_end])           # fit on train only — no leakage
+    scaled_data = scaler.transform(raw_data)    # [T, 4], normalised
 
     SEQ_LENGTH = 12
-    X = create_classification_sequences(scaled_data, SEQ_LENGTH)  # [n, 12, 4]
+    X = create_classification_sequences(scaled_data, SEQ_LENGTH)  # [n_seq, 12, 4]
 
     # Spectral class labels from NDVI thresholds (paper, Section 5)
     y = []
@@ -366,17 +413,84 @@ if __name__ == "__main__":
 
     print("\n--- SPECTRAL DIFFERENTIATION APPLIED ---")
     print(f"Healthy       (NDVI ≥ 0.6):  {np.sum(y == 0)} samples")
-    print(f"Rust-infected (NDVI 0.2–0.6):{np.sum(y == 1)} samples")
+    print(f"Rust-infected (NDVI 0.2–0.6):  {np.sum(y == 1)} samples")
     print(f"Stressed      (NDVI < 0.2):  {np.sum(y == 2)} samples")
+
+    # Each sequence i is labelled using raw_data index (i + SEQ_LENGTH - 1).
+    # Assign it to train/val/test based on which segment that index falls in.
+    seq_label_idx = np.arange(len(y)) + SEQ_LENGTH - 1
+    train_mask = seq_label_idx < train_end
+    val_mask   = (seq_label_idx >= train_end) & (seq_label_idx < val_end)
+    test_mask  = seq_label_idx >= val_end
 
     X_tensor = torch.tensor(X, dtype=torch.float32)
     y_tensor = torch.tensor(y, dtype=torch.long)
 
+    X_train, y_train = X_tensor[train_mask], y_tensor[train_mask]
+    X_val,   y_val    = X_tensor[val_mask],   y_tensor[val_mask]
+    X_test,  y_test    = X_tensor[test_mask],  y_tensor[test_mask]
+
+    print(f"\nSplit sizes — train: {len(y_train)} | val: {len(y_val)} | test: {len(y_test)}")
+
+    class_names = ['Healthy', 'Rust-infected', 'Stressed']
+
+    # --------------------------------------------------------------------------
+    # 5-FOLD CROSS-VALIDATION — paper Section 5.
+    #
+    # Applied to X_train/y_train (the 70% training segment) using
+    # TimeSeriesSplit, which always places earlier timestamps in the training
+    # portion and later timestamps in the validation portion — preserving
+    # temporal ordering within each fold, consistent with the chronological
+    # split used for the main holdout.
+    #
+    # Note: sequences in X_train were normalised using a scaler fit on the
+    # full 70% segment, so scale state is shared across folds. This is an
+    # accepted trade-off for a time-series pipeline; the critical boundary
+    # (the unseen 15% test set) remains completely isolated throughout.
+    # --------------------------------------------------------------------------
+    print("\n--- 5-FOLD CROSS-VALIDATION (TimeSeriesSplit on training segment) ---")
+
+    tscv       = TimeSeriesSplit(n_splits=5)
+    CV_EPOCHS  = 100  # Fewer epochs per fold than the final run — sufficient to converge
+    fold_rows  = []
+
+    for fold_idx, (tr_idx, vl_idx) in enumerate(tscv.split(X_train)):
+        X_tr    = X_train[tr_idx];  y_tr = y_train[tr_idx]
+        X_vl    = X_train[vl_idx];  y_vl = y_train[vl_idx]
+
+        preds   = train_single_fold(X_tr, y_tr, X_vl, y_vl, SEQ_LENGTH, CV_EPOCHS)
+        y_vl_np = y_vl.numpy()
+
+        report  = classification_report(
+            y_vl_np, preds, labels=[0, 1, 2],
+            target_names=class_names, output_dict=True, zero_division=0
+        )
+        acc = report['accuracy']
+        p   = report['weighted avg']['precision']
+        r   = report['weighted avg']['recall']
+        f1  = report['weighted avg']['f1-score']
+        fold_rows.append({'acc': acc, 'precision': p, 'recall': r, 'f1': f1})
+
+        print(f"  Fold {fold_idx + 1}/5 | "
+              f"train={len(y_tr):>3}  val={len(y_vl):>3} | "
+              f"Acc: {100*acc:.2f}%  P: {p:.3f}  R: {r:.3f}  F1: {f1:.3f}")
+
+    accs = [m['acc']       for m in fold_rows]
+    ps   = [m['precision'] for m in fold_rows]
+    rs   = [m['recall']    for m in fold_rows]
+    f1s  = [m['f1']        for m in fold_rows]
+
+    print(f"\n  Summary (mean ± std across 5 folds):")
+    print(f"    Accuracy:  {100*np.mean(accs):.2f}% ± {100*np.std(accs):.2f}%")
+    print(f"    Precision: {np.mean(ps):.3f} ± {np.std(ps):.3f}")
+    print(f"    Recall:    {np.mean(rs):.3f} ± {np.std(rs):.3f}")
+    print(f"    F1-Score:  {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
+
     # Mini-batch training — paper uses batch_size=128 with 1,875 images.
     # Scaled here for the smaller satellite time-series dataset.
-    BATCH_SIZE = min(128, max(16, len(y) // 4))
-    dataset    = TensorDataset(X_tensor, y_tensor)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    BATCH_SIZE = min(128, max(8, len(y_train) // 4))
+    train_dataset = TensorDataset(X_train, y_train)
+    dataloader    = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     model     = FCNNClassifier(seq_length=SEQ_LENGTH, n_indices=4, hidden_dim=128, num_classes=3)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
@@ -385,9 +499,9 @@ if __name__ == "__main__":
     flat_dim = SEQ_LENGTH * 5
     print(f"\nTraining FCNN | flat_dim={flat_dim} | hidden=128 | batch={BATCH_SIZE}")
     EPOCHS = 150
-    model.train()
 
     for epoch in range(EPOCHS):
+        model.train()
         epoch_loss, epoch_correct, epoch_total = 0.0, 0, 0
 
         for X_batch, y_batch in dataloader:
@@ -403,12 +517,61 @@ if __name__ == "__main__":
             epoch_loss    += loss.item()
 
         if (epoch + 1) % 25 == 0:
-            acc = 100.0 * epoch_correct / epoch_total
-            avg_loss = epoch_loss / len(dataloader)
-            print(f"Epoch [{epoch+1:>3}/{EPOCHS}] | Loss: {avg_loss:.4f} | Accuracy: {acc:.2f}%")
+            train_acc = 100.0 * epoch_correct / epoch_total
+            avg_loss  = epoch_loss / len(dataloader)
+
+            # Validation accuracy — held out from training, mirrors paper's
+            # "validation accuracy stabilising" tracking during convergence.
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(X_val)
+                val_acc = 100.0 * (torch.argmax(val_logits, dim=1) == y_val).float().mean().item()
+
+            print(f"Epoch [{epoch+1:>3}/{EPOCHS}] | Loss: {avg_loss:.4f} | "
+                  f"Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
 
     final_weights = model.hvi_layer.weights.data.numpy()
     print(f"\nFinal HVI weights — Eq. (1) (NDVI, GNDVI, EVI, MSAVI):\n{final_weights}")
+
+    # --------------------------------------------------------------------------
+    # TEST SET EVALUATION — paper Section 5/6: confusion matrix + per-class
+    # precision/recall/F1 (Figure 4, Table 1). All metrics below are computed
+    # on X_test/y_test, never seen during training or epoch monitoring.
+    # --------------------------------------------------------------------------
+    model.eval()
+    with torch.no_grad():
+        test_logits = model(X_test)
+        test_preds  = torch.argmax(test_logits, dim=1).numpy()
+    y_test_np = y_test.numpy()
+
+    test_acc = 100.0 * (test_preds == y_test_np).mean() if len(y_test_np) > 0 else float('nan')
+
+    print(f"\n--- TEST SET PERFORMANCE (held-out, n={len(y_test_np)}) ---")
+    print(f"Test Accuracy: {test_acc:.2f}%")
+    print("\nClassification Report:")
+    print(classification_report(
+        y_test_np, test_preds,
+        labels=[0, 1, 2], target_names=class_names,
+        zero_division=0
+    ))
+
+    cm = confusion_matrix(y_test_np, test_preds, labels=[0, 1, 2])
+
+    plt.style.use('dark_background')
+    fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+    im = ax_cm.imshow(cm, cmap='Greens')
+    ax_cm.set_xticks(range(3)); ax_cm.set_xticklabels(class_names, rotation=20)
+    ax_cm.set_yticks(range(3)); ax_cm.set_yticklabels(class_names)
+    ax_cm.set_xlabel('Predicted'); ax_cm.set_ylabel('Actual')
+    ax_cm.set_title(f'Confusion Matrix — Test Set (Acc: {test_acc:.2f}%)')
+    for i in range(3):
+        for j in range(3):
+            ax_cm.text(j, i, str(cm[i, j]), ha='center', va='center', color='black')
+
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png', facecolor='black', dpi=200)
+    print("Saved 'confusion_matrix.png'.")
+    plt.show()
 
     generate_spatial_change_maps(final_weights)
 
