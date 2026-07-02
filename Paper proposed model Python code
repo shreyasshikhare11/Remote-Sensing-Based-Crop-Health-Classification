@@ -19,18 +19,23 @@ import warnings
 warnings.filterwarnings('ignore')
 
 ROI_COORDINATES = [
-    [0.11418197537867325, 51.60197836363603],
-    [0.11761520291773575, 51.58480890623496],
-    [0.11967513944117325, 51.5857688608265],
-    [0.13435218717066544, 51.58811533111258],
-    [0.1381287374636342,  51.59024838075696],
-    [0.14190528775660294, 51.59094160032738],
-    [0.1422486105105092,  51.593287803457216],
-    [0.15083167935816544, 51.597553316868726],
-    [0.15246246243922013, 51.59797984617759],
-    [0.1381287374636342,  51.60203167482375],
-    [0.1360688009401967,  51.604590538230035],
-    [0.1292023458620717,  51.60864177704568]
+    [0.15448166331768043, 51.68972009902471],
+          [0.1522500654172898, 51.68184460851777],
+          [0.15465332469463355, 51.67950298227802],
+          [0.15739990672588355, 51.67354193269015],
+          [0.1577432294797898, 51.668005969776125],
+          [0.17611099681377418, 51.657357985556494],
+          [0.18229080638408668, 51.66033967337168],
+          [0.19980026683330543, 51.66694128395644],
+          [0.21022809584378965, 51.674130217785056],
+          [0.21512044508695372, 51.67748336117029],
+          [0.22336019118070372, 51.67822847043015],
+          [0.22670758803128965, 51.68035728647656],
+          [0.1970960005068756, 51.69222360178421],
+          [0.19263280470609434, 51.69844818242294],
+          [0.18216146071195372, 51.69882056608803],
+          [0.1758099897646881, 51.69802259733909],
+          [0.16722692091703184, 51.69882056608803]
 ]
 
 # ==============================================================================
@@ -51,7 +56,7 @@ def mask_s2_clouds(image):
 
 def fetch_satellite_data():
     """Fetches Sentinel-2 weekly time-series or generates synthetic data if auth fails."""
-    start_date = '2020-06-28'
+    start_date = '2023-06-28'
     end_date   = datetime.now().strftime('%Y-%m-%d')
 
     try:
@@ -103,8 +108,8 @@ def fetch_satellite_data():
 
         def get_mean(img):
             means = img.select(['NDVI', 'GNDVI', 'EVI', 'MSAVI', 'NDRE']).reduceRegion(
-                reducer=ee.Reducer.mean(), geometry=roi, scale=30,
-                bestEffort=True, maxPixels=1e12, tileScale=16)
+                reducer=ee.Reducer.mean(), geometry=roi, scale=30, bestEffort=True, maxPixels=1e12, tileScale=16)
+            
             return ee.Feature(None, {
                 'date':  img.date().format('YYYY-MM-dd'),
                 'NDVI':  means.get('NDVI'),
@@ -261,7 +266,7 @@ def generate_spatial_change_maps(learned_weights):
     Generates field condition maps using the 4-weight HVI from the trained FCNN.
     NDRE is included in the change maps as supplementary spectral information.
     """
-    print("\nConnecting to GEE for spatial change maps (2020 vs 2026)...")
+    print("\nConnecting to GEE for spatial change maps (initial date vs current date)...")
     try:
         ee.Authenticate()
         ee.Initialize(project='my-project-31577-475312')
@@ -291,7 +296,7 @@ def generate_spatial_change_maps(learned_weights):
                      .filterBounds(roi)
                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
                      .map(mask_s2_clouds))
-        img_start = s2_col.filterDate('2020-01-01', '2020-12-31').map(calc_idx).median().clip(roi)
+        img_start = s2_col.filterDate('2023-01-01', '2023-12-31').map(calc_idx).median().clip(roi)
         img_end   = s2_col.filterDate('2026-01-01', '2026-12-31').map(calc_idx).median().clip(roi)
 
         change_base = img_end.subtract(img_start)
@@ -343,10 +348,10 @@ def generate_spatial_change_maps(learned_weights):
                 vis_params = {'min': 0, 'max': 1, 'palette': ['black', 'magenta']}
                 title_text = "Targeted Intervention Map\n(VRT Application)"
             elif 'Crop_Health_Class' in idx:
-                vis_params = {'min': 0, 'max': 2, 'palette': ['#00FF00', '#FFA500', '#FF0000']}
-                title_text = f"Ground-Truth Classes\n({'2020 Start' if 'Start' in idx else '2026 End'})"
+                vis_params = {'min': 0, 'max': 2, 'palette': ['2D8A4E', 'E69F00', '9E2A2B']}
+                title_text = f"Ground-Truth Classes\n({'2023 Start' if 'Start' in idx else '2026 End'})"
             else:
-                vis_params = {'min': -0.2, 'max': 0.2, 'palette': ['red', 'white', 'green']}
+                vis_params = {'min': -0.2, 'max': 0.2, 'palette': ['7F0000', 'D73027', 'F46D43', 'FEE08B', 'F7F7F7', 'D9EF8B', 'A6D96A', '1A9850', '00441B']}
                 title_text = f"Δ {idx} (Change)"
 
             url = final_change_img.select(idx).getThumbURL(
@@ -364,7 +369,6 @@ def generate_spatial_change_maps(learned_weights):
 
     except Exception as e:
         print(f"Skipping spatial maps — GEE auth required. ({e})")
-
 
 # ==============================================================================
 # PIPELINE EXECUTION
